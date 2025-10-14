@@ -1,0 +1,69 @@
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+
+# --- Python bytecode / caches ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+drl-scale/
+drl-scale311/
+*.venv
+
+# --- Build / packaging ---
+build/
+dist/
+pip-wheel-metadata/
+.python-version
+
+# --- Notebooks & checkpoints (if any) ---
+.ipynb_checkpoints/
+
+# --- Logs / profiles ---
+*.log
+*.out
+*.err
+.prof
+.profraw
+
+# --- IDE / editor settings ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- Environment & secrets ---
+.env
+.env.*
+*.secret
+*.key
+
+# --- Data & outputs (generated) ---
+out*/
+results*/
+figures*/
+plots*/
+*.png
+*.pdf
+*.svg
+*.json
+
+# Keep README markers inside output dirs if you want folder structure
+!out*/README.md
+!results*/README.md
+
+# --- Misc you likely don't want ---
+coverage/
+htmlcov/
+.cache/
+.mypy_cache/
+.pytest_cache/
