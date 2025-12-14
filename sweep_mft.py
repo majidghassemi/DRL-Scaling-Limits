@@ -1,4 +1,4 @@
-import math, argparse, json, random, os
+import math, argparse, itertools, json, random, os
 from pathlib import Path
 import numpy as np
 import torch as th
@@ -8,7 +8,7 @@ from torch.utils.data import TensorDataset, DataLoader
 import matplotlib.pyplot as plt
 
 # -------------------------
-# Repro + device
+# 1) Repro + device
 # -------------------------
 def set_seed(s=0):
     random.seed(s); np.random.seed(s); th.manual_seed(s)
@@ -16,48 +16,42 @@ def set_seed(s=0):
 device = th.device("cuda" if th.cuda.is_available() else "cpu")
 
 # -------------------------
-# NTK 2-Layer Model
-# f(x) = (1/sqrt(N)) * W1 * phi(W0 * x)
+# 2) Mean-field 2-layer MLP
+# f(x) = (1/N) * W1 * phi(W0 * x)
 # -------------------------
-class NTKTwoLayer(nn.Module):
+class MFTwoLayer(nn.Module):
     def __init__(self, d_in, n_hidden, d_out, act="relu"):
         super().__init__()
-        self.n_hidden = n_hidden
-        self.d_in = d_in
+        self.d_in, self.n_hidden, self.d_out = d_in, n_hidden, d_out
         
         self.W0 = nn.Linear(d_in, n_hidden, bias=False)
         self.W1 = nn.Linear(n_hidden, d_out, bias=False)
         self.act = getattr(F, act)
-
-        # -----------------------------------------------------
-        # NTK Parameterization (Standard / Lazy Regime)
-        # -----------------------------------------------------
-        # W0: He init (std ~ 1/sqrt(d_in)) so activations are O(1)
+        
+        # --- MFT Initialization ---
+        # W0: He init to keep activations O(1)
         nn.init.kaiming_normal_(self.W0.weight, nonlinearity=act)
         
-        # W1: Sample from N(0, 1)
-        # We explicitly divide by sqrt(N) in forward pass
-        nn.init.normal_(self.W1.weight, mean=0.0, std=1.0) 
+        # W1: Standard Normal N(0, 1)
+        # We divide by N (n_hidden) in the forward pass
+        nn.init.normal_(self.W1.weight, mean=0.0, std=1.0)
 
     def forward(self, x):
-        # x: (Batch, d_in)
         h = self.act(self.W0(x))
-        
-        # NTK Scaling: output is O(1) at init because sum of N terms is divided by sqrt(N)
-        return (self.W1(h)) / math.sqrt(self.n_hidden)
+        # MFT Scaling: Divide by N (not sqrt(N))
+        return (self.W1(h)) / self.n_hidden 
 
 # -------------------------
-# Synthetic teacher data (Non-linear 2-layer)
+# 3) Synthetic teacher data 
 # -------------------------
-def make_dataset(n_train=4096, n_val=1024, d_in=32, seed=123):
+def make_dataset(n_train=4096, n_val=1024, d_in=32, seed=0):
     rng = np.random.default_rng(seed)
     Xtr = rng.standard_normal((n_train, d_in)).astype(np.float32)
     Xva = rng.standard_normal((n_val,   d_in)).astype(np.float32)
     
-    # Teacher: Fixed wide network (width 4096) to provide realizable targets
-    # We use the same architecture so the student can theoretically match it
-    teacher = NTKTwoLayer(d_in, 4096, 1).to(device).eval()
-    
+    # Teacher: fixed wide random net (MFT style)
+    # We use a wide teacher so the target function is realizable
+    teacher = MFTwoLayer(d_in, 4096, 1).to(device).eval()
     with th.no_grad():
         ytr = teacher(th.from_numpy(Xtr).to(device)).cpu().numpy()
         yva = teacher(th.from_numpy(Xva).to(device)).cpu().numpy()
@@ -65,17 +59,16 @@ def make_dataset(n_train=4096, n_val=1024, d_in=32, seed=123):
     return (Xtr, ytr), (Xva, yva)
 
 # -------------------------
-# Train for fixed steps with a given LR
+# 4) Train Loop
 # -------------------------
-def train_once(dset_tr, dset_va, d_in, n_hidden, lr, steps=1000, bs=256, seed=0):
+def train_once(dset_tr, dset_va, d_in, n_hidden, d_out, lr, steps=1000, bs=256, seed=0):
     set_seed(seed)
-    # Student model with variable width 'n_hidden'
-    model = NTKTwoLayer(d_in, n_hidden, d_out=1).to(device)
-    
-    # SGD matches theoretical analysis best
+    model = MFTwoLayer(d_in, n_hidden, d_out).to(device)
     opt = th.optim.SGD(model.parameters(), lr=lr)
     
-    Xtr, ytr = dset_tr; Xva, yva = dset_va
+    Xtr, ytr = dset_tr
+    Xva, yva = dset_va
+    
     tr_loader = DataLoader(TensorDataset(th.from_numpy(Xtr), th.from_numpy(ytr)),
                            batch_size=bs, shuffle=True, drop_last=True)
     it = iter(tr_loader)
@@ -104,52 +97,40 @@ def train_once(dset_tr, dset_va, d_in, n_hidden, lr, steps=1000, bs=256, seed=0)
     return va
 
 # -------------------------
-# Sweep LR across widths
+# 5) Sweep Logic
 # -------------------------
 def sweep(widths, base_etas, alpha, steps, bs, seeds, d_in=32):
-    # Fixed dataset for all widths to ensure comparability
     (Xtr, ytr), (Xva, yva) = make_dataset(d_in=d_in, seed=123)
+    results = [] 
     
-    results = []
     for n in widths:
         for eta0 in base_etas:
             # Transfer rule: lr = eta0 * n^alpha
-            # NOTE: For NTK, theory suggests alpha is usually -1 (lr ~ 1/width) or 0 depending on parameterization
             lr_raw = eta0 * (n ** alpha)
             
-            vals = []
+            val_losses = []
             for s in range(seeds):
-                v = train_once((Xtr, ytr), (Xva, yva), d_in, n, lr_raw, steps=steps, bs=bs, seed=1000+s)
-                vals.append(v)
-            
+                v = train_once((Xtr, ytr), (Xva, yva),
+                               d_in=d_in, n_hidden=n, d_out=1,
+                               lr=lr_raw, steps=steps, bs=bs, seed=1000+s)
+                val_losses.append(v)
+                
             results.append({
-                "width": int(n),
+                "width": n,
                 "eta0": float(eta0),
                 "lr_raw": float(lr_raw),
-                "val_loss": float(np.mean(vals)),
-                "val_std": float(np.std(vals)),
+                "val_loss": float(np.mean(val_losses)),
+                "val_std": float(np.std(val_losses))
             })
     return results
 
 # -------------------------
-# Collapse score
-# -------------------------
-def collapse_score(results, widths):
-    eta0s = sorted({r["eta0"] for r in results})
-    var_list = []
-    for e in eta0s:
-        losses = [r["val_loss"] for r in results if abs(r["eta0"] - e) < 1e-18]
-        if len(losses) >= 2:
-            var_list.append(np.var(losses))
-    return float(np.mean(var_list)) if var_list else float("inf")
-
-# -------------------------
-# Plotting
+# 6) Plotting
 # -------------------------
 def plot_results(results, widths, alpha, outdir):
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
-
+    
     # (A) Loss vs raw LR
     fig = plt.figure()
     for n in widths:
@@ -160,13 +141,12 @@ def plot_results(results, widths, alpha, outdir):
     plt.xscale("log"); plt.yscale("log")
     plt.xlabel("learning rate (raw)")
     plt.ylabel("validation MSE")
-    plt.title(f"NTK 2-Layer: Loss vs LR (α={alpha})")
-    plt.grid(True, which="both", ls=":")
-    plt.legend()
-    fig.savefig(outdir / f"ntk_loss_vs_lr_alpha{alpha}.png", bbox_inches="tight")
+    plt.title(f"MFT 2-Layer: Loss vs LR (α={alpha})")
+    plt.legend(); plt.grid(True, which="both", ls=":")
+    fig.savefig(outdir / f"mft_loss_vs_lr_alpha{alpha}.png", bbox_inches="tight")
     plt.close(fig)
 
-    # (B) Loss vs base-eta (The Collapse Plot)
+    # (B) Loss vs base-eta (Collapse Plot)
     fig = plt.figure()
     for n in widths:
         xs = [r["eta0"] for r in results if r["width"] == n]
@@ -174,48 +154,38 @@ def plot_results(results, widths, alpha, outdir):
         order = np.argsort(xs); xs = np.array(xs)[order]; ys = np.array(ys)[order]
         plt.plot(xs, ys, marker="o", label=f"N={n}")
     plt.xscale("log"); plt.yscale("log")
-    plt.xlabel("base learning rate η₀")
+    plt.xlabel(r"base learning rate $\eta_0$")
     plt.ylabel("validation MSE")
-    plt.title(f"NTK 2-Layer: Alignment (α={alpha})")
-    plt.grid(True, which="both", ls=":")
-    plt.legend()
-    fig.savefig(outdir / f"ntk_loss_vs_eta0_alpha{alpha}.png", bbox_inches="tight")
+    plt.title(f"MFT 2-Layer: Alignment (α={alpha})")
+    plt.legend(); plt.grid(True, which="both", ls=":")
+    fig.savefig(outdir / f"mft_loss_vs_eta0_alpha{alpha}.png", bbox_inches="tight")
     plt.close(fig)
 
-# -------------------------
-# Main
-# -------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--widths", type=int, nargs="+", default=[64, 128, 256, 512, 1024])
-    ap.add_argument("--steps", type=int, default=1000)
-    ap.add_argument("--batch", type=int, default=128)
-    ap.add_argument("--seeds", type=int, default=3)
-    
-    # In NTK regime, we often expect alpha=0 (constant LR) or alpha=-1 (1/N) depending on setup.
-    # We default to 0 here because of the 1/sqrt(N) scaling in forward.
-    ap.add_argument("--alpha", type=float, default=0.0, help="lr = η0 * n^alpha")
-    
-    ap.add_argument("--eta0_min", type=float, default=1e-3)
-    ap.add_argument("--eta0_max", type=float, default=10.0)
+    ap.add_argument("--widths", type=int, nargs="+", default=[64, 128, 256, 512])
+    ap.add_argument("--eta0_min", type=float, default=1e-5)
+    ap.add_argument("--eta0_max", type=float, default=1.0)
     ap.add_argument("--eta0_points", type=int, default=20)
     
-    ap.add_argument("--outdir", type=str, default="out_ntk_2layer")
+    # Default alpha=1.0 for MFT (Linear scaling with width)
+    ap.add_argument("--alpha", type=float, default=1.0, help="lr = eta0 * n^alpha")
+    
+    ap.add_argument("--steps", type=int, default=1000)
+    ap.add_argument("--batch", type=int, default=256)
+    ap.add_argument("--seeds", type=int, default=3)
+    ap.add_argument("--outdir", type=str, default="out_mft_2layer")
     args = ap.parse_args()
 
     set_seed(0)
-
-    base_etas = np.logspace(
-        math.log10(args.eta0_min),
-        math.log10(args.eta0_max),
-        args.eta0_points
-    )
-
-    print(f"Sweeping NTK 2-Layer | widths={args.widths} | alpha={args.alpha}")
+    
+    base_etas = np.logspace(math.log10(args.eta0_min), math.log10(args.eta0_max), args.eta0_points)
+    
+    print(f"Sweeping MFT 2-Layer | widths={args.widths} | alpha={args.alpha}")
     results = sweep(args.widths, base_etas, args.alpha, args.steps, args.batch, args.seeds)
     
     Path(args.outdir).mkdir(parents=True, exist_ok=True)
-    with open(Path(args.outdir) / f"results_ntk_alpha{args.alpha}.json", "w") as f:
+    with open(Path(args.outdir) / f"results_mft_alpha{args.alpha}.json", "w") as f:
         json.dump(results, f, indent=2)
         
     plot_results(results, args.widths, args.alpha, args.outdir)

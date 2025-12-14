@@ -48,11 +48,9 @@ pip-wheel-metadata/
 *.key
 
 # --- Data & outputs (generated) ---
-out*/
 results*/
 figures*/
 plots*/
-*.png
 *.pdf
 *.svg
 *.json
